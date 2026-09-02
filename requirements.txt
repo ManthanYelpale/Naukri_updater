@@ -1,0 +1,11 @@
+# Core dependencies
+selenium>=4.20.0
+schedule>=1.2.1
+python-dotenv>=1.0.1
+
+# Optional: only used as a fallback if Selenium Manager can't fetch a driver.
+# Selenium 4.6+ handles driver downloads automatically, so this is not strictly
+# required. While it stays commented out the fallback branch in build_driver()
+# is inert and driver failures raise immediately — install it if you ever hit a
+# driver-version mismatch.
+# webdriver-manager>=4.0.1
