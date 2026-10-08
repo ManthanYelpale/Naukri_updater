@@ -67,6 +67,7 @@ NOTES / LIMITATIONS
 import os
 import sys
 import time
+import socket
 import logging
 import argparse
 from datetime import datetime
@@ -161,6 +162,7 @@ RUN_TIME = "09:00"
 # How long to wait for the upload to actually show up on the profile, and how
 # long to let the page settle afterwards before quitting the browser. Tearing
 # Chrome down too early aborts the in-flight upload request.
+RESUME_INPUT_TIMEOUT = 45
 UPLOAD_TIMEOUT = 90
 POST_UPLOAD_SETTLE = 5
 
@@ -335,30 +337,38 @@ def update_resume(driver: webdriver.Chrome) -> bool:
         return False
 
     file_input = None
-    # Let the profile page settle so lazy-loaded sections exist.
-    try:
-        wait.until(EC.presence_of_element_located((By.XPATH, "//input[@type='file']")))
-    except TimeoutException:
-        log.error("No file input appeared on the profile page — layout may have changed.")
-        return False
-
-    for by, sel in RESUME_INPUT_LOCATORS:
-        try:
-            el = driver.find_element(by, sel)
-            file_input = el
-            log.info(f"Using resume upload input located by: {by} = {sel!r}")
+    # Poll for a resume-SPECIFIC input for the full timeout. Waiting for any
+    # //input[@type='file'] and then searching once is a race: the profile-photo
+    # uploader satisfies that wait immediately, while Naukri lazy-loads the
+    # resume card a moment later. A single-shot search then finds nothing and
+    # gives up. That is exactly how the unattended 11:00 run failed while
+    # hand-run tests passed — the page just happened to be slower.
+    deadline = time.time() + RESUME_INPUT_TIMEOUT
+    matched = None
+    while time.time() < deadline:
+        for by, sel in RESUME_INPUT_LOCATORS:
+            try:
+                file_input = driver.find_element(by, sel)
+                matched = (by, sel)
+                break
+            except NoSuchElementException:
+                continue
+        if file_input is not None:
             break
-        except NoSuchElementException:
-            continue
+        time.sleep(1)
 
     if file_input is None:
+        seen = len(driver.find_elements(By.XPATH, "//input[@type='file']"))
         log.error(
-            "Found file input(s) on the page, but none of them matched a resume "
-            "upload field. Refusing to guess — uploading to an unidentified file "
-            "input risks sending the PDF to the profile-photo field. Naukri's "
-            "layout has probably changed; update resume_input_locators."
+            f"No resume upload field appeared within {RESUME_INPUT_TIMEOUT}s "
+            f"({seen} other file input(s) on the page). Refusing to guess — "
+            f"uploading to an unidentified file input risks sending the PDF to "
+            f"the profile-photo field. If this persists, Naukri's layout has "
+            f"changed and RESUME_INPUT_LOCATORS needs updating."
         )
         return False
+
+    log.info(f"Using resume upload input located by: {matched[0]} = {matched[1]!r}")
 
     try:
         # Verify the upload actually landed, using the ONE piece of ground
@@ -487,9 +497,35 @@ def ensure_logged_in(driver: webdriver.Chrome) -> bool:
     return login(driver)
 
 
+def wait_for_network(timeout: int = 120) -> bool:
+    """Block until naukri.com is reachable, or give up after `timeout` seconds.
+
+    Needed because this runs at logon and on wake from sleep. This machine uses
+    Modern Standby with networking disconnected while asleep, so a wake-timer
+    run can easily start before Wi-Fi is back. Without this the job would fail
+    on a DNS error and the slot would just be lost.
+    """
+    deadline = time.time() + timeout
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            socket.create_connection(("www.naukri.com", 443), timeout=5).close()
+            if attempt > 1:
+                log.info(f"Network available after {attempt} attempts.")
+            return True
+        except OSError:
+            time.sleep(5)
+    log.error(f"No network connectivity after {timeout}s — skipping this run.")
+    return False
+
+
 def run_update_job():
     log.info("=" * 60)
     log.info(f"Starting scheduled resume update at {datetime.now()}")
+
+    if not wait_for_network():
+        return
 
     driver = None
     try:
